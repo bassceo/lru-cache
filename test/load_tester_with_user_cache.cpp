@@ -10,13 +10,16 @@
 using namespace std;
 namespace fs = std::filesystem;
 
-void worker_thread(int iterations) {
+void run_test(int iterations) {
     vector<int> data(1000);
 
-    stringstream ss;
-    ss << "temp_" << this_thread::get_id();
-    string temp_dir = ss.str();
-    fs::create_directory(temp_dir);
+    string temp_dir = "temp_dir";
+    try {
+        fs::create_directory(temp_dir);
+    } catch (const fs::filesystem_error& e) {
+        cerr << "Error creating directory: " << e.what() << endl;
+        return;
+    }
 
     random_device rd;
     mt19937 generator(rd());
@@ -29,37 +32,24 @@ void worker_thread(int iterations) {
         ema_sort_int(data, temp_dir);
     }
 
-    fs::remove_all(temp_dir);
+    try {
+        fs::remove_all(temp_dir);
+    } catch (const fs::filesystem_error& e) {
+        cerr << "Error removing directory: " << e.what() << endl;
+    }
 }
 
-int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        cerr << "Usage: " << argv[0] << " <num_threads> <iterations>" << endl;
-        cerr << "  <num_threads>: number of threads" << endl;
-        cerr << "  <iterations>: number of iterations per thread" << endl;
-        return 1;
-    }
+int main() {
+    int iterations = 1000; // Set a default number of iterations
 
-    int num_threads = stoi(argv[1]);
-    int iterations = stoi(argv[2]);
-
-    vector<thread> threads;
     auto start = chrono::high_resolution_clock::now();
 
-    for (int i = 0; i < num_threads; i++) {
-        threads.emplace_back(worker_thread, iterations);
-    }
-
-    for (auto& t : threads) {
-        t.join();
-    }
+    run_test(iterations);
 
     auto end = chrono::high_resolution_clock::now();
-    auto duration = chrono::duration_cast<chrono::seconds>(end - start);
     auto duration_precise = chrono::duration_cast<chrono::duration<double>>(end - start);
 
-    cout << "CPU load completed with " << num_threads << " threads and "
-         << iterations << " iterations per thread. Execution time: "
+    cout << "CPU load completed with " << iterations << " iterations. Execution time: "
          << duration_precise.count() << " seconds." << endl;
 
     return 0;
