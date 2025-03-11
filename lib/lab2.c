@@ -7,20 +7,32 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 
 #ifndef O_DIRECT
 #define O_DIRECT 0
 #endif
 
+// Small cache configuration
+// #define BLOCK_SIZE 512
+// #define CACHE_CAPACITY 16
+
+// Medium cache configuration
+// #define BLOCK_SIZE 2048 
+// #define CACHE_CAPACITY 64
+
+// Large cache configuration
 #define BLOCK_SIZE 4096
 #define CACHE_CAPACITY 128
+
+// Extra large cache configuration
+// #define BLOCK_SIZE 8192
+// #define CACHE_CAPACITY 256
 
 typedef struct CacheBlock {
     off_t block_number;
     char *data;
     bool dirty;
-    struct CacheBlock *prev;
-    struct CacheBlock *next;
     struct CacheBlock *next_hash;
 } CacheBlock;
 
@@ -28,8 +40,6 @@ typedef struct Lab2File {
     int fd;
     off_t file_size;
     off_t offset;
-    CacheBlock *lru_head;
-    CacheBlock *lru_tail;
     size_t cache_count;
     CacheBlock *hash_table[CACHE_CAPACITY];
 } Lab2File;
@@ -39,18 +49,6 @@ static int file_index;
 
 static unsigned hash_off(off_t block_number) {
     return (unsigned)(block_number % CACHE_CAPACITY);
-}
-
-static void move_to_head(Lab2File *f, CacheBlock *b) {
-    if (!b || b == f->lru_head) return;
-    if (b->prev) b->prev->next = b->next;
-    if (b->next) b->next->prev = b->prev;
-    if (f->lru_tail == b) f->lru_tail = b->prev;
-    b->prev = NULL;
-    b->next = f->lru_head;
-    if (f->lru_head) f->lru_head->prev = b;
-    f->lru_head = b;
-    if (!f->lru_tail) f->lru_tail = b;
 }
 
 static void remove_from_hash(Lab2File *f, CacheBlock *b) {
@@ -68,16 +66,28 @@ static void remove_from_hash(Lab2File *f, CacheBlock *b) {
 }
 
 static CacheBlock* evict_block(Lab2File *f) {
-    CacheBlock *b = f->lru_tail;
-    if (!b) return NULL;
+    if (f->cache_count == 0) return NULL;
+    
+    unsigned bucket = rand() % CACHE_CAPACITY;
+    unsigned original_bucket = bucket;
+    CacheBlock *b = NULL;
+    CacheBlock *prev = NULL;
+
+    while (!f->hash_table[bucket] && bucket < CACHE_CAPACITY) bucket++;
+    if (bucket == CACHE_CAPACITY) {
+        bucket = 0;
+        while (!f->hash_table[bucket] && bucket < original_bucket) bucket++;
+    }
+
+    if (!f->hash_table[bucket]) return NULL;
+
+    b = f->hash_table[bucket];
     if (b->dirty) {
         off_t off = b->block_number * BLOCK_SIZE;
         pwrite(f->fd, b->data, BLOCK_SIZE, off);
     }
-    remove_from_hash(f, b);
-    if (b->prev) b->prev->next = NULL;
-    f->lru_tail = b->prev;
-    if (f->lru_head == b) f->lru_head = NULL;
+
+    f->hash_table[bucket] = b->next_hash;
     f->cache_count--;
     return b;
 }
@@ -104,7 +114,7 @@ static CacheBlock* load_block(Lab2File *f, off_t block_num) {
     posix_memalign((void**)&b->data, BLOCK_SIZE, BLOCK_SIZE);
     b->block_number = block_num;
     b->dirty = false;
-    b->prev = b->next = b->next_hash = NULL;
+    b->next_hash = NULL;
     {
         off_t off = block_num * BLOCK_SIZE;
         ssize_t r = pread(f->fd, b->data, BLOCK_SIZE, off);
@@ -116,10 +126,6 @@ static CacheBlock* load_block(Lab2File *f, off_t block_num) {
         b->next_hash = f->hash_table[i];
         f->hash_table[i] = b;
     }
-    b->next = f->lru_head;
-    if (f->lru_head) f->lru_head->prev = b;
-    f->lru_head = b;
-    if (!f->lru_tail) f->lru_tail = b;
     f->cache_count++;
     return b;
 }
@@ -130,14 +136,18 @@ static Lab2File* get_file(int idx) {
 }
 
 int lab2_open(const char *path) {
+    static bool seed_initialized = false;
+    if (!seed_initialized) {
+        srand(time(NULL));
+        seed_initialized = true;
+    }
+
     int real_fd = open(path, O_CREAT | O_RDWR | O_DIRECT, 0666);
     if (real_fd < 0) return -1;
     Lab2File *lf = malloc(sizeof(Lab2File));
     memset(lf, 0, sizeof(Lab2File));
     lf->fd = real_fd;
     lf->offset = 0;
-    lf->lru_head = NULL;
-    lf->lru_tail = NULL;
     lf->cache_count = 0;
     memset(lf->hash_table, 0, sizeof(lf->hash_table));
     lf->file_size = lseek(real_fd, 0, SEEK_END);
@@ -150,16 +160,13 @@ int lab2_close(int fd) {
     Lab2File *f = get_file(fd);
     if (!f) return -1;
     for (;;) {
-        CacheBlock *b = f->lru_tail;
+        CacheBlock *b = f->hash_table[0];
         if (!b) break;
         if (b->dirty) {
             off_t off = b->block_number * BLOCK_SIZE;
             pwrite(f->fd, b->data, BLOCK_SIZE, off);
         }
         remove_from_hash(f, b);
-        if (b->prev) b->prev->next = NULL;
-        f->lru_tail = b->prev;
-        if (f->lru_head == b) f->lru_head = NULL;
         free(b->data);
         free(b);
     }
@@ -193,8 +200,6 @@ ssize_t lab2_read(int fd, void *buf, size_t count) {
         CacheBlock *b = find_block(f, bn);
         if (!b) {
             b = load_block(f, bn);
-        } else {
-            move_to_head(f, b);
         }
         memcpy(p, b->data + off, can_read);
         total += can_read;
@@ -231,19 +236,15 @@ ssize_t lab2_write(int fd, const void *buf, size_t count) {
                 memset(b->data, 0, BLOCK_SIZE);
                 b->block_number = bn;
                 b->dirty = false;
-                b->prev = b->next = b->next_hash = NULL;
+                b->next_hash = NULL;
                 {
                     unsigned i = hash_off(bn);
                     b->next_hash = f->hash_table[i];
                     f->hash_table[i] = b;
                 }
-                b->next = f->lru_head;
-                if (f->lru_head) f->lru_head->prev = b;
-                f->lru_head = b;
-                if (!f->lru_tail) f->lru_tail = b;
                 f->cache_count++;
             }
-        } else move_to_head(f, b);
+        }
         memcpy(b->data + off, p, can_write);
         b->dirty = true;
         total += can_write;
@@ -278,14 +279,14 @@ off_t lab2_lseek(int fd, off_t offset, int whence) {
 int lab2_fsync(int fd) {
     Lab2File *f = get_file(fd);
     if (!f) return -1;
-    CacheBlock *b = f->lru_head;
+    CacheBlock *b = f->hash_table[0];
     while (b) {
         if (b->dirty) {
             off_t off = b->block_number * BLOCK_SIZE;
             pwrite(f->fd, b->data, BLOCK_SIZE, off);
             b->dirty = false;
         }
-        b = b->next;
+        b = b->next_hash;
     }
     fsync(f->fd);
     return 0;

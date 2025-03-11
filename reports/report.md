@@ -7,7 +7,7 @@
 ```JSON
 {
   "target_os": "Linux",
-  "cache_policy": "LRU"
+  "cache_policy": "Random"
 }
 ```
 
