@@ -41,9 +41,6 @@ typedef ssize_t (*lab2_write_t)(int, const void *, size_t);
 typedef off_t   (*lab2_lseek_t)(int, off_t, int);
 typedef int     (*lab2_fsync_t)(int);
 
-// -----------------------------------------------------------------------------
-// 3) Унифицированная структура MyIO
-// -----------------------------------------------------------------------------
 typedef struct MyIO {
     int     (*my_open2) (const char* path, int flags, mode_t mode);
     ssize_t (*my_read2) (int, void*, size_t);
@@ -85,7 +82,6 @@ static ssize_t write_ints(const MyIO* io, int fd, const int* buf, size_t n) {
             return -1;
         }
         if (w == 0) {
-            // Записали 0 байт - нештатная ситуация
             break;
         }
         done += w;

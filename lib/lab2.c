@@ -173,12 +173,10 @@ ssize_t lab2_read(int fd, void *buf, size_t count) {
     Lab2File *f = get_file(fd);
     if (!f) return -1;
 
-    // Если уже в конце (или за ним), сразу возврат 0
     if (f->offset >= f->file_size) {
         return 0;
     }
 
-    // Если хотим прочесть "слишком много" - урежем запрос
     if (f->offset + count > f->file_size) {
         count = f->file_size - f->offset;
     }
@@ -192,14 +190,12 @@ ssize_t lab2_read(int fd, void *buf, size_t count) {
         if (can_read > count) {
             can_read = count;
         }
-        // поиск/загрузка блока
         CacheBlock *b = find_block(f, bn);
         if (!b) {
             b = load_block(f, bn);
         } else {
             move_to_head(f, b);
         }
-        // копирование
         memcpy(p, b->data + off, can_read);
         total += can_read;
         p += can_read;

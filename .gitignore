@@ -1,2 +1,6 @@
 lab2_test
 liblab2.so
+.vscode
+.DS_Store
+*.o
+*.out
