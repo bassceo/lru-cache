@@ -14,20 +14,17 @@
 #endif
 
 // Small cache configuration
-// #define BLOCK_SIZE 512
-// #define CACHE_CAPACITY 16
+#define BLOCK_SIZE 512
+#define CACHE_CAPACITY 16
 
 // Medium cache configuration
 // #define BLOCK_SIZE 2048 
 // #define CACHE_CAPACITY 64
 
 // Large cache configuration
-#define BLOCK_SIZE 4096
-#define CACHE_CAPACITY 128
+// #define BLOCK_SIZE 4096
+// #define CACHE_CAPACITY 128
 
-// Extra large cache configuration
-// #define BLOCK_SIZE 8192
-// #define CACHE_CAPACITY 256
 
 typedef struct CacheBlock {
     off_t block_number;
