@@ -31,6 +31,11 @@
 | **1024**  | rand | 3   | 1235.54       | 2756.00         |
 
 
+## Анимация моей работы
+
+<img src="./reports/animation.gif">
+
+
 <!-- [Отчёт](./reports/REPORT.md)  
 [Отчёт PDF](./reports/report.pdf) -->
 

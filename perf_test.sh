@@ -1,66 +1,62 @@
 #!/bin/sh
 
+# Build the project
+echo "Building the project..."
 make clean
 make all
+echo
 
-# echo "Size(MB) | Mode  | Run | no_cache(ms) | with_cache(ms)"
-# echo "------------------------------------------------------"
+echo "==================================================="
+echo "              Performance Test Suite                 "
+echo "==================================================="
+echo
 
-# for size in 256 512 1024
-# do
-#   FILE="testfile_${size}MB.bin"
+# Test 1: Cache Performance Test
+echo "Test 1: LRU Cache Performance Test"
+echo "Description: Evaluating cache performance with different"
+echo "file sizes and access patterns (sequential and random)"
+echo "==================================================="
+echo
+echo "Size(MB) | Mode  | Run | no_cache(ms) | with_cache(ms)"
+echo "------------------------------------------------------"
+
+for size in 256 512 1024
+do
+  FILE="testfile_${size}MB.bin"
+
+  dd if=/dev/zero of=$FILE bs=1M count=$size 2>/dev/null
   
-#   dd if=/dev/zero of=$FILE bs=1M count=$size 2>/dev/null
-  
-#   for mode in seq rand
-#   do
-#     for run in 1 2 3
-#     do
-#       sync
-#       echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1
+  for mode in seq rand
+  do
+    for run in 1 2 3
+    do
+      
+      # Clear system caches
+      sync
+      echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1
 
-#       output=$(./lab2_test $mode $FILE $((size*1024*1024)))
+      output=$(./lab2_test $mode $FILE $((size*1024*1024)))
 
-#       no_cache=$(echo "$output" | awk -F'[= ]' '{print $2}')
-#       with_cache=$(echo "$output" | awk -F'[= ]' '{print $5}')
+      no_cache=$(echo "$output" | awk -F'[= ]' '{print $2}')
+      with_cache=$(echo "$output" | awk -F'[= ]' '{print $5}')
 
-#       echo "$size      | $mode |  $run  | $no_cache       | $with_cache"
-#     done
-#   done
-# done
-
-SIZE=4
-LOADER_FILE="loader_testfile_${SIZE}MB.bin"
-
-# Создадим тестовый файл:
-dd if=/dev/zero of=$LOADER_FILE bs=1M count=$SIZE 2>/dev/null
+      echo "$size      | $mode |  $run  | $no_cache       | $with_cache"
+    done
+  done
+done
 
 echo
-echo "----------- Loader test (file=${LOADER_FILE}) -----------"
-echo "Run | no_cache(ms) | with_cache(ms)"
-echo "------------------------------------"
+echo "==================================================="
+echo "Test 2: External Integer Sorting Test"
+echo "Description: Testing the performance of external"
+echo "merge sort implementation for integer arrays"
+echo "==================================================="
+./ema-sort-int-test
 
-for run in 1 2 3
-do
-  # Сбросим системный кэш перед запуском
-  sync
-  echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1
-
-  # Засечём время без пользовательского кэша
-  start=$(date +%s.%N)
-  ./loader_no_cache "$LOADER_FILE"
-  end=$(date +%s.%N)
-  nocache_time=$(echo "($end - $start) * 1000" | bc | awk '{printf "%.0f", $0}')
-
-  # Сбросим кэш ещё раз
-  sync
-  echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1
-
-  # Засечём время с пользовательским кэшем
-  start=$(date +%s.%N)
-  ./loader_with_cache "$LOADER_FILE"
-  end=$(date +%s.%N)
-  cache_time=$(echo "($end - $start) * 1000" | bc | awk '{printf "%.0f", $0}')
-
-  echo "$run   | $nocache_time       | $cache_time"
-done
+# Cleanup section
+echo
+echo "Cleaning up temporary files..."
+rm -f $LOADER_FILE
+rm -f run-*-*.bin merge-*-*.bin input.bin output_sys.bin output_lab2.bin
+make clean
+echo "Cleanup complete"

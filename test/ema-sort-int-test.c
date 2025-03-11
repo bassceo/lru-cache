@@ -1,523 +1,566 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/time.h>
+#include <sys/stat.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <stdarg.h>
+#include <time.h>
 
-// ----------------------------------------------------------------------
-// Определения типов для функций из liblab2.so
-// ----------------------------------------------------------------------
-typedef int     (*lab2_open_t)(const char *);
+static int sys_open(const char* path, int flags, mode_t mode) {
+    return open(path, flags, mode);
+}
+
+static ssize_t sys_read(int fd, void* buf, size_t count) {
+    return read(fd, buf, count);
+}
+
+static ssize_t sys_write(int fd, const void* buf, size_t count) {
+    return write(fd, buf, count);
+}
+
+static off_t sys_lseek(int fd, off_t offset, int whence) {
+    return lseek(fd, offset, whence);
+}
+
+static int sys_close(int fd) {
+    return close(fd);
+}
+
+static int sys_fsync(int fd) {
+    return fsync(fd);
+}
+
+typedef int     (*lab2_open_t) (const char *);
 typedef int     (*lab2_close_t)(int);
-typedef ssize_t (*lab2_read_t)(int, void *, size_t);
+typedef ssize_t (*lab2_read_t) (int, void *, size_t);
 typedef ssize_t (*lab2_write_t)(int, const void *, size_t);
 typedef off_t   (*lab2_lseek_t)(int, off_t, int);
 typedef int     (*lab2_fsync_t)(int);
 
-// ----------------------------------------------------------------------
-// Глобальные указатели на функции для случая "lab2", а также флажок режима
-// ----------------------------------------------------------------------
-static lab2_open_t  g_lab2_open  = NULL;
-static lab2_close_t g_lab2_close = NULL;
-static lab2_read_t  g_lab2_read  = NULL;
-static lab2_write_t g_lab2_write = NULL;
-static lab2_lseek_t g_lab2_lseek = NULL;
-static lab2_fsync_t g_lab2_fsync = NULL;
+// -----------------------------------------------------------------------------
+// 3) Унифицированная структура MyIO
+// -----------------------------------------------------------------------------
+typedef struct MyIO {
+    int     (*my_open2) (const char* path, int flags, mode_t mode);
+    ssize_t (*my_read2) (int, void*, size_t);
+    ssize_t (*my_write2)(int, const void*, size_t);
+    off_t   (*my_lseek2)(int, off_t, int);
+    int     (*my_close2)(int);
+    int     (*my_fsync2)(int);
+} MyIO;
 
-typedef enum {
-    MODE_NONE,
-    MODE_SYS,  // Системные вызовы
-    MODE_LIB   // Функции lab2_*
-} IO_Mode;
+static MyIO g_sys_io;
+static MyIO g_lab2_io;
 
-static IO_Mode g_io_mode = MODE_NONE;
-
-// ----------------------------------------------------------------------
-// "Обёртки" для операций ввода-вывода.
-// В зависимости от режима (sys или lib) вызываем либо системный вызов,
-// либо функцию из динамической библиотеки.
-// ----------------------------------------------------------------------
-
-int my_open(const char* path, int flags, mode_t mode) {
-    if (g_io_mode == MODE_SYS) {
-        return open(path, flags, mode);
-    } else {
-        // Для упрощения примера игнорируем флаги, кроме O_CREAT | O_RDWR
-        // (В самой liblab2 это тоже игнорируется – там жёстко O_CREAT|O_RDWR|O_DIRECT)
-        return g_lab2_open ? g_lab2_open(path) : -1;
-    }
-}
-
-int my_close(int fd) {
-    if (g_io_mode == MODE_SYS) {
-        return close(fd);
-    } else {
-        return g_lab2_close ? g_lab2_close(fd) : -1;
-    }
-}
-
-ssize_t my_read(int fd, void* buf, size_t count) {
-    if (g_io_mode == MODE_SYS) {
-        return read(fd, buf, count);
-    } else {
-        return g_lab2_read ? g_lab2_read(fd, buf, count) : -1;
-    }
-}
-
-ssize_t my_write(int fd, const void* buf, size_t count) {
-    if (g_io_mode == MODE_SYS) {
-        return write(fd, buf, count);
-    } else {
-        return g_lab2_write ? g_lab2_write(fd, buf, count) : -1;
-    }
-}
-
-off_t my_lseek(int fd, off_t offset, int whence) {
-    if (g_io_mode == MODE_SYS) {
-        return lseek(fd, offset, whence);
-    } else {
-        return g_lab2_lseek ? g_lab2_lseek(fd, offset, whence) : (off_t)-1;
-    }
-}
-
-int my_fsync(int fd) {
-    if (g_io_mode == MODE_SYS) {
-        return fsync(fd);
-    } else {
-        return g_lab2_fsync ? g_lab2_fsync(fd) : -1;
-    }
-}
-
-// ----------------------------------------------------------------------
-// Функция для замера времени (в миллисекундах)
-// ----------------------------------------------------------------------
-static double get_time_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
-}
-
-// ----------------------------------------------------------------------
-// Генерация файла со случайными int
-// ----------------------------------------------------------------------
-static int generate_random_file(const char* path, long count) {
-    FILE* f = fopen(path, "wb");
-    if (!f) {
-        perror("fopen");
-        return -1;
-    }
-    srand(12345); // Для воспроизводимости
-    for (long i = 0; i < count; i++) {
-        int val = rand();
-        fwrite(&val, sizeof(int), 1, f);
-    }
-    fclose(f);
-    return 0;
-}
-
-// ----------------------------------------------------------------------
-// Сортировка массива int (в памяти) - просто qsort
-// ----------------------------------------------------------------------
-static int cmp_int(const void* a, const void* b) {
-    int x = *(const int*)a;
-    int y = *(const int*)b;
-    return (x < y) ? -1 : (x > y) ? 1 : 0;
-}
-
-// ----------------------------------------------------------------------
-// Прочитать из fd до `max_count` int, записать в буфер buf. Вернуть,
-// сколько реально прочли. Возвращаем -1 при ошибке.
-// ----------------------------------------------------------------------
-static ssize_t read_ints(int fd, int* buf, size_t max_count) {
-    size_t total_read = 0;
-    while (total_read < max_count) {
-        ssize_t r = my_read(fd, buf + total_read, (max_count - total_read)*sizeof(int));
+static ssize_t read_ints(const MyIO* io, int fd, int* buf, size_t n) {
+    size_t to_read = n * sizeof(int);
+    size_t done = 0;
+    while (done < to_read) {
+        ssize_t r = io->my_read2(fd, (char*)buf + done, to_read - done);
         if (r < 0) {
-            perror("my_read");
+            if (errno == EINTR) continue;
+            perror("read");
             return -1;
         }
-        if (r == 0) {
-            // EOF
+        if (r == 0) { // EOF
             break;
         }
-        total_read += (r / sizeof(int));
+        done += r;
     }
-    return (ssize_t)total_read;
+    return (done / sizeof(int));
 }
 
-// ----------------------------------------------------------------------
-// Записать в fd все int из буфера buf
-// ----------------------------------------------------------------------
-static int write_ints(int fd, const int* buf, size_t count) {
-    size_t total_written = 0;
-    while (total_written < count) {
-        ssize_t w = my_write(fd, buf + total_written, (count - total_written)*sizeof(int));
+static ssize_t write_ints(const MyIO* io, int fd, const int* buf, size_t n) {
+    size_t to_write = n * sizeof(int);
+    size_t done = 0;
+    while (done < to_write) {
+        ssize_t w = io->my_write2(fd, (char*)buf + done, to_write - done);
         if (w < 0) {
-            perror("my_write");
+            if (errno == EINTR) continue;
+            perror("write");
             return -1;
         }
-        total_written += (w / sizeof(int));
+        if (w == 0) {
+            // Записали 0 байт - нештатная ситуация
+            break;
+        }
+        done += w;
     }
-    return 0;
+    return (done / sizeof(int));
 }
 
-// ----------------------------------------------------------------------
-// Фаза 1: Формирование ран. Читаем из входного файла чанками по chunk_size,
-// сортируем в памяти, пишем в отдельные временные файлы (ran0.bin, ran1.bin, ...).
-// Возвращаем количество созданных ран или -1 при ошибке.
-// ----------------------------------------------------------------------
-static int create_runs(const char* input_path, long count, long chunk_size) {
-    int fd_in = my_open(input_path, O_RDONLY, 0666);
+static int cmp_ints(const void* a, const void* b) {
+    int x = *(const int*)a;
+    int y = *(const int*)b;
+    return (x > y) - (x < y);
+}
+
+static int create_runs(const MyIO* io,
+                       const char* input_file,
+                       size_t total_ints,
+                       size_t chunk_size,
+                       char*** out_run_files,
+                       int* out_run_count)
+{
+    int fd_in = io->my_open2(input_file, O_RDONLY, 0);
     if (fd_in < 0) {
-        perror("my_open (input)");
+        perror("open input_file");
         return -1;
     }
 
-    long nums_left = count;
-    int run_idx = 0;
+    int max_runs = (total_ints + chunk_size - 1) / chunk_size;
+    char** runs = (char**)calloc(max_runs, sizeof(char*));
+    if (!runs) {
+        fprintf(stderr, "calloc runs failed\n");
+        io->my_close2(fd_in);
+        return -1;
+    }
+
     int* buffer = (int*)malloc(chunk_size * sizeof(int));
     if (!buffer) {
-        fprintf(stderr, "malloc error\n");
-        my_close(fd_in);
+        fprintf(stderr, "malloc buffer failed\n");
+        free(runs);
+        io->my_close2(fd_in);
         return -1;
     }
 
-    while (nums_left > 0) {
-        char run_name[256];
-        snprintf(run_name, sizeof(run_name), "run_%d.bin", run_idx);
-        int fd_out = my_open(run_name, O_CREAT | O_RDWR, 0666);
-        if (fd_out < 0) {
-            perror("my_open (run)");
-            free(buffer);
-            my_close(fd_in);
-            return -1;
-        }
-        // Считываем часть
-        long to_read = (nums_left < chunk_size) ? nums_left : chunk_size;
-        ssize_t got = read_ints(fd_in, buffer, to_read);
-        if (got < 0) {
-            my_close(fd_out);
-            free(buffer);
-            my_close(fd_in);
-            return -1;
-        }
-        // Сортируем
-        qsort(buffer, got, sizeof(int), cmp_int);
-        // Записываем
-        if (write_ints(fd_out, buffer, got) < 0) {
-            my_close(fd_out);
-            free(buffer);
-            my_close(fd_in);
-            return -1;
-        }
-        my_close(fd_out);
+    int run_count = 0;
+    size_t read_so_far = 0;
 
-        nums_left -= got;
-        run_idx++;
+    while (read_so_far < total_ints) {
+        size_t left = total_ints - read_so_far;
+        size_t this_chunk = (left < chunk_size) ? left : chunk_size;
+
+        ssize_t got = read_ints(io, fd_in, buffer, this_chunk);
+        if (got < 0) {
+            free(buffer);
+            free(runs);
+            io->my_close2(fd_in);
+            return -1;
+        }
+
+        qsort(buffer, got, sizeof(int), cmp_ints);
+
+        char run_name[64];
+        snprintf(run_name, sizeof(run_name),
+                 "run-%d-%p.bin", run_count, (void*)io);
+        runs[run_count] = strdup(run_name);
+
+        int fd_run = io->my_open2(runs[run_count],
+                                  O_CREAT|O_RDWR|O_TRUNC,
+                                  0666);
+        if (fd_run < 0) {
+            perror("open run file");
+            free(buffer);
+            for (int k = 0; k < run_count; k++) {
+                free(runs[k]);
+            }
+            free(runs);
+            io->my_close2(fd_in);
+            return -1;
+        }
+        if (write_ints(io, fd_run, buffer, got) < 0) {
+            io->my_close2(fd_run);
+            free(buffer);
+            for (int k = 0; k < run_count; k++) {
+                free(runs[k]);
+            }
+            free(runs);
+            io->my_close2(fd_in);
+            return -1;
+        }
+        io->my_close2(fd_run);
+
+        run_count++;
+        read_so_far += got;
     }
 
     free(buffer);
-    my_close(fd_in);
-    return run_idx;
-}
+    io->my_close2(fd_in);
 
-// ----------------------------------------------------------------------
-// Маленькая структура для k-путевого слияния
-// ----------------------------------------------------------------------
-typedef struct {
-    int fd;
-    int current;   // текущий элемент из блока
-    int has_value; // 1, если в current что-то есть
-} RunSource;
-
-// ----------------------------------------------------------------------
-// Считываем следующий int из fd в source->current. 
-// Если достигнут EOF, ставим has_value=0. Иначе has_value=1.
-// ----------------------------------------------------------------------
-static int read_next(RunSource* src) {
-    int val;
-    ssize_t r = my_read(src->fd, &val, sizeof(int));
-    if (r == 0) {
-        // EOF
-        src->has_value = 0;
-        return 0;
-    } else if (r < 0) {
-        perror("my_read in merge");
-        return -1;
-    }
-    src->current = val;
-    src->has_value = 1;
+    *out_run_files = runs;
+    *out_run_count = run_count;
     return 0;
 }
 
-// ----------------------------------------------------------------------
-// Фаза 2: k-путевое слияние всех ран (run_0.bin, run_1.bin, ... , run_{n-1}.bin)
-// в итоговый файл output_sorted.bin
-// ----------------------------------------------------------------------
-static int merge_runs(int run_count, const char* output_path) {
-    // Откроем итоговый файл:
-    int fd_out = my_open(output_path, O_CREAT | O_RDWR | O_TRUNC, 0666);
-    if (fd_out < 0) {
-        perror("my_open (output)");
-        return -1;
-    }
-
-    // Открываем все ран-файлы
-    RunSource* sources = (RunSource*)calloc(run_count, sizeof(RunSource));
-    if (!sources) {
-        fprintf(stderr, "calloc error\n");
-        my_close(fd_out);
-        return -1;
-    }
-
-    for (int i = 0; i < run_count; i++) {
-        char run_name[256];
-        snprintf(run_name, sizeof(run_name), "run_%d.bin", i);
-        sources[i].fd = my_open(run_name, O_RDONLY, 0666);
-        if (sources[i].fd < 0) {
-            perror("my_open (merge run)");
-            // закроем уже открытые
-            for (int j = 0; j < i; j++) {
-                my_close(sources[j].fd);
-            }
-            free(sources);
-            my_close(fd_out);
-            return -1;
-        }
-    }
-
-    // Считаем по 1 int из каждого рана в буфер
-    for (int i = 0; i < run_count; i++) {
-        if (read_next(&sources[i]) < 0) {
-            // Ошибка
-            for (int j = 0; j < run_count; j++) {
-                my_close(sources[j].fd);
-            }
-            free(sources);
-            my_close(fd_out);
-            return -1;
-        }
-    }
-
-    // Пока хоть один источник не пуст
-    while (1) {
-        int min_val = 0;
-        int min_idx = -1;
-        for (int i = 0; i < run_count; i++) {
-            if (sources[i].has_value) {
-                if (min_idx < 0 || sources[i].current < min_val) {
-                    min_val = sources[i].current;
-                    min_idx = i;
-                }
-            }
-        }
-        if (min_idx < 0) {
-            // Все пустые
-            break;
-        }
-        // Запишем min_val
-        if (my_write(fd_out, &min_val, sizeof(int)) < 0) {
-            perror("my_write (merge)");
-            // освобождаем всё
-            for (int j = 0; j < run_count; j++) {
-                my_close(sources[j].fd);
-            }
-            free(sources);
-            my_close(fd_out);
-            return -1;
-        }
-        // Считаем следующий int из источника min_idx
-        if (read_next(&sources[min_idx]) < 0) {
-            // освобождаем всё
-            for (int j = 0; j < run_count; j++) {
-                my_close(sources[j].fd);
-            }
-            free(sources);
-            my_close(fd_out);
-            return -1;
-        }
-    }
-
-    // Закрываем ран-файлы
-    for (int i = 0; i < run_count; i++) {
-        my_close(sources[i].fd);
-    }
-    free(sources);
-
-    // Синхронизировать на диск и закрыть
-    my_fsync(fd_out);
-    my_close(fd_out);
-
-    return 0;
-}
-
-// ----------------------------------------------------------------------
-// Собственно внешняя сортировка:
-//   1) Фаза создания ран
-//   2) Фаза слияния
-// ----------------------------------------------------------------------
-static int external_sort(const char* input_path, const char* output_path,
-                         long count, long chunk_size) 
+static int merge_two_runs(const MyIO* io,
+                          const char* runA,
+                          const char* runB,
+                          const char* outFile)
 {
-    // 1) Формируем раны
-    int run_count = create_runs(input_path, count, chunk_size);
-    if (run_count < 0) {
+    int fdA = io->my_open2(runA, O_RDONLY, 0);
+    if (fdA < 0) {
+        perror("open runA");
         return -1;
     }
-    if (run_count == 0) {
-        // Пустой файл?
-        return 0;
-    }
-    // 2) Сливаем раны
-    if (merge_runs(run_count, output_path) < 0) {
+    int fdB = io->my_open2(runB, O_RDONLY, 0);
+    if (fdB < 0) {
+        perror("open runB");
+        io->my_close2(fdA);
         return -1;
     }
+    int fdOut = io->my_open2(outFile, O_CREAT|O_RDWR|O_TRUNC, 0666);
+    if (fdOut < 0) {
+        perror("open outFile");
+        io->my_close2(fdA);
+        io->my_close2(fdB);
+        return -1;
+    }
+
+    int valA, valB;
+    ssize_t rA = read_ints(io, fdA, &valA, 1);
+    ssize_t rB = read_ints(io, fdB, &valB, 1);
+
+    while (rA > 0 && rB > 0) {
+        if (valA <= valB) {
+            if (write_ints(io, fdOut, &valA, 1) < 0) {
+                io->my_close2(fdA);
+                io->my_close2(fdB);
+                io->my_close2(fdOut);
+                return -1;
+            }
+            rA = read_ints(io, fdA, &valA, 1);
+        } else {
+            if (write_ints(io, fdOut, &valB, 1) < 0) {
+                io->my_close2(fdA);
+                io->my_close2(fdB);
+                io->my_close2(fdOut);
+                return -1;
+            }
+            rB = read_ints(io, fdB, &valB, 1);
+        }
+    }
+    while (rA > 0) {
+        if (write_ints(io, fdOut, &valA, 1) < 0) {
+            io->my_close2(fdA);
+            io->my_close2(fdB);
+            io->my_close2(fdOut);
+            return -1;
+        }
+        rA = read_ints(io, fdA, &valA, 1);
+    }
+    while (rB > 0) {
+        if (write_ints(io, fdOut, &valB, 1) < 0) {
+            io->my_close2(fdA);
+            io->my_close2(fdB);
+            io->my_close2(fdOut);
+            return -1;
+        }
+        rB = read_ints(io, fdB, &valB, 1);
+    }
+
+    io->my_close2(fdA);
+    io->my_close2(fdB);
+    io->my_close2(fdOut);
     return 0;
 }
 
-// ----------------------------------------------------------------------
-// Проверка, что файл отсортирован
-// ----------------------------------------------------------------------
-static int check_sorted(const char* path, long count) {
-    FILE* f = fopen(path, "rb");
-    if (!f) {
-        perror("fopen check_sorted");
-        return -1;
+static int merge_all_runs(const MyIO* io,
+                          char** run_files,
+                          int run_count,
+                          const char* output_file)
+{
+    if (run_count == 1) {
+        return merge_two_runs(io, run_files[0], "/dev/null", output_file);
     }
-    int prev = 0, cur = 0;
-    if (count > 0) {
-        if (fread(&prev, sizeof(int), 1, f) != 1) {
-            fclose(f);
+
+    int current_count = run_count;
+
+    while (current_count > 1) {
+        char** next_runs = (char**)calloc(current_count, sizeof(char*));
+        if (!next_runs) {
+            fprintf(stderr, "calloc next_runs failed\n");
+            return -1;
+        }
+        int new_count = 0;
+
+        for (int i = 0; i < current_count; i += 2) {
+            if (i + 1 < current_count) {
+                char tmp_name[64];
+                snprintf(tmp_name, sizeof(tmp_name),
+                         "merge-%d-%p.bin", i/2, (void*)io);
+
+                if (merge_two_runs(io, run_files[i], run_files[i+1], tmp_name) < 0) {
+                    free(next_runs);
+                    return -1;
+                }
+                if (run_files[i]) {
+                    free(run_files[i]);
+                    run_files[i] = NULL;
+                }
+                if (run_files[i+1]) {
+                    free(run_files[i+1]);
+                    run_files[i+1] = NULL;
+                }
+                next_runs[new_count] = strdup(tmp_name);
+                new_count++;
+            } else {
+                next_runs[new_count] = run_files[i];
+                run_files[i] = NULL;
+                new_count++;
+            }
+        }
+
+        for (int k = 0; k < new_count; k++) {
+            run_files[k] = next_runs[k];
+        }
+        for (int k = new_count; k < current_count; k++) {
+            run_files[k] = NULL;
+        }
+        current_count = new_count;
+
+        free(next_runs);
+    }
+
+    if (current_count == 1) {
+        if (merge_two_runs(io, run_files[0], "/dev/null", output_file) < 0) {
             return -1;
         }
     }
-    for (long i = 1; i < count; i++) {
-        if (fread(&cur, sizeof(int), 1, f) != 1) {
-            fclose(f);
-            return -1;
-        }
-        if (cur < prev) {
-            fprintf(stderr, "File is NOT sorted (pos=%ld)\n", i);
-            fclose(f);
-            return -1;
-        }
-        prev = cur;
-    }
-    fclose(f);
+
     return 0;
 }
 
-// ----------------------------------------------------------------------
-// Точка входа
-// ----------------------------------------------------------------------
-int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, 
-            "Usage:\n"
-            "  %s gen <path> <count>\n"
-            "  %s sys <path> <count> <chunk>\n"
-            "  %s lib <path> <count> <chunk>\n",
-            argv[0], argv[0], argv[0]);
-        return 1;
+static int external_sort(const MyIO* io,
+                         const char* input_file,
+                         const char* output_file,
+                         size_t total_ints,
+                         size_t chunk_size)
+{
+    char** run_files = NULL;
+    int run_count = 0;
+    if (create_runs(io, input_file, total_ints, chunk_size,
+                    &run_files, &run_count) < 0)
+    {
+        return -1;
     }
 
-    // Если команда "gen" - просто генерируем случайный файл
-    if (strcmp(argv[1], "gen") == 0) {
-        if (argc < 4) {
-            fprintf(stderr, "Usage: %s gen <path> <count>\n", argv[0]);
-            return 1;
+    if (merge_all_runs(io, run_files, run_count, output_file) < 0) {
+        for (int i = 0; i < run_count; i++) {
+            if (run_files[i]) {
+                unlink(run_files[i]);
+                free(run_files[i]);
+            }
         }
-        const char* path = argv[2];
-        long count = atol(argv[3]);
-        if (count <= 0) {
-            fprintf(stderr, "count must be positive\n");
-            return 1;
+        free(run_files);
+        return -1;
+    }
+
+    for (int i = 0; i < run_count; i++) {
+        if (run_files[i]) {
+            unlink(run_files[i]);
+            free(run_files[i]);
         }
-        if (generate_random_file(path, count) < 0) {
-            fprintf(stderr, "Error generating file\n");
-            return 1;
+    }
+    free(run_files);
+
+    int fd_out = io->my_open2(output_file, O_RDWR, 0);
+    if (fd_out >= 0) {
+        io->my_fsync2(fd_out);
+        io->my_close2(fd_out);
+    }
+
+    return 0;
+}
+
+static int generate_input_file(const MyIO* io,
+                               const char* fname,
+                               size_t n)
+{
+    int fd = io->my_open2(fname, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (fd < 0) {
+        perror("open for generate");
+        return -1;
+    }
+    int* data = (int*)malloc(n * sizeof(int));
+    if (!data) {
+        io->my_close2(fd);
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        data[i] = rand();
+    }
+    if (write_ints(io, fd, data, n) < 0) {
+        free(data);
+        io->my_close2(fd);
+        return -1;
+    }
+    free(data);
+    io->my_close2(fd);
+    return 0;
+}
+
+static double measure_sort_time(const MyIO* io,
+                                const char* input_file,
+                                const char* output_file,
+                                size_t total_ints,
+                                size_t chunk_size)
+{
+    struct timeval t1, t2;
+    gettimeofday(&t1, NULL);
+
+    if (external_sort(io, input_file, output_file, total_ints, chunk_size) < 0) {
+        return -1.0;
+    }
+
+    gettimeofday(&t2, NULL);
+    double ms = (t2.tv_sec - t1.tv_sec)*1000.0 +
+                (t2.tv_usec - t1.tv_usec)/1000.0;
+    return ms;
+}
+
+static int sys_open_wrapper(const char* path, int flags, mode_t mode) {
+    return sys_open(path, flags, mode);
+}
+static ssize_t sys_read_wrapper(int fd, void* buf, size_t sz) {
+    return sys_read(fd, buf, sz);
+}
+static ssize_t sys_write_wrapper(int fd, const void* buf, size_t sz) {
+    return sys_write(fd, buf, sz);
+}
+static off_t sys_lseek_wrapper(int fd, off_t off, int wh) {
+    return sys_lseek(fd, off, wh);
+}
+static int sys_close_wrapper(int fd) {
+    return sys_close(fd);
+}
+static int sys_fsync_wrapper(int fd) {
+    return sys_fsync(fd);
+}
+
+static lab2_open_t   f_open   = NULL;
+static lab2_close_t  f_close  = NULL;
+static lab2_read_t   f_read   = NULL;
+static lab2_write_t  f_write  = NULL;
+static lab2_lseek_t  f_lseek  = NULL;
+static lab2_fsync_t  f_fsync  = NULL;
+
+static int lab2_open_wrapper(const char* path, int flags, mode_t mode) {
+    (void)flags; // игнорируем
+    (void)mode;  
+    if (!f_open) return -1;
+    return f_open(path);
+}
+static int lab2_close_wrapper(int fd) {
+    if (!f_close) return -1;
+    return f_close(fd);
+}
+static ssize_t lab2_read_wrapper(int fd, void* buf, size_t sz) {
+    if (!f_read) return -1;
+    return f_read(fd, buf, sz);
+}
+static ssize_t lab2_write_wrapper(int fd, const void* buf, size_t sz) {
+    if (!f_write) return -1;
+    return f_write(fd, buf, sz);
+}
+static off_t lab2_lseek_wrapper(int fd, off_t off, int wh) {
+    if (!f_lseek) return -1;
+    return f_lseek(fd, off, wh);
+}
+static int lab2_fsync_wrapper(int fd) {
+    if (!f_fsync) return -1;
+    return f_fsync(fd);
+}
+
+static int init_io_structs(void)
+{
+    g_sys_io.my_open2  = sys_open_wrapper;
+    g_sys_io.my_read2  = sys_read_wrapper;
+    g_sys_io.my_write2 = sys_write_wrapper;
+    g_sys_io.my_lseek2 = sys_lseek_wrapper;
+    g_sys_io.my_close2 = sys_close_wrapper;
+    g_sys_io.my_fsync2 = sys_fsync_wrapper;
+
+    void* handle = dlopen("./liblab2.so", RTLD_LAZY);
+    if (!handle) {
+        return -1;
+    }
+
+    *(void **)(&f_open)  = dlsym(handle, "lab2_open");
+    *(void **)(&f_close) = dlsym(handle, "lab2_close");
+    *(void **)(&f_read)  = dlsym(handle, "lab2_read");
+    *(void **)(&f_write) = dlsym(handle, "lab2_write");
+    *(void **)(&f_lseek) = dlsym(handle, "lab2_lseek");
+    *(void **)(&f_fsync) = dlsym(handle, "lab2_fsync");
+
+    char* err = dlerror();
+    if (err) {
+        fprintf(stderr, "dlsym error: %s\n", err);
+        return -1;
+    }
+
+    g_lab2_io.my_open2  = lab2_open_wrapper;
+    g_lab2_io.my_close2 = lab2_close_wrapper;
+    g_lab2_io.my_read2  = lab2_read_wrapper;
+    g_lab2_io.my_write2 = lab2_write_wrapper;
+    g_lab2_io.my_lseek2 = lab2_lseek_wrapper;
+    g_lab2_io.my_fsync2 = lab2_fsync_wrapper;
+
+    return 0;
+}
+
+int main(void)
+{
+    srand((unsigned)time(NULL));
+
+    int lab2_ok = (init_io_structs() == 0);
+
+    struct {
+        size_t total_ints;
+        size_t chunk_size;
+    } tests[] = {
+        { 20000,  2000 },
+        { 50000,  5000 },
+        {100000, 10000},
+    };
+    int num_tests = sizeof(tests) / sizeof(tests[0]);
+
+    printf(" total_ints | chunk_size |   sys_time(ms)  |  lab2_time(ms)\n");
+    printf("------------+------------+-----------------+----------------\n");
+
+    for (int i = 0; i < num_tests; i++) {
+        size_t total = tests[i].total_ints;
+        size_t chunk = tests[i].chunk_size;
+
+        if (generate_input_file(&g_sys_io, "input.bin", total) < 0) {
+            fprintf(stderr, "Failed to generate input.bin\n");
+            continue;
         }
-        printf("Generated %ld integers in file %s\n", count, path);
-        return 0;
-    }
 
-    // Иначе предполагается режим "sys" или "lib" + сортировка
-    if (argc < 5) {
-        fprintf(stderr, "Usage: %s <sys|lib> <path> <count> <chunk>\n", argv[0]);
-        return 1;
-    }
-    const char* mode = argv[1];
-    const char* path = argv[2];
-    long count = atol(argv[3]);
-    long chunk_size = atol(argv[4]);
-    if (count <= 0 || chunk_size <= 0) {
-        fprintf(stderr, "count and chunk must be positive\n");
-        return 1;
-    }
+        double sys_time = measure_sort_time(&g_sys_io,
+                                            "input.bin",
+                                            "output_sys.bin",
+                                            total,
+                                            chunk);
 
-    if (strcmp(mode, "sys") == 0) {
-        g_io_mode = MODE_SYS;
-    } else if (strcmp(mode, "lib") == 0) {
-        g_io_mode = MODE_LIB;
-        // Загружаем библиотеку
-        void *handle = dlopen("./liblab2.so", RTLD_LAZY);
-        if (!handle) {
-            fprintf(stderr, "Cannot open liblab2.so: %s\n", dlerror());
-            return 1;
+        double lab2_time = -1.0;
+        if (lab2_ok) {
+            if (generate_input_file(&g_sys_io, "input.bin", total) == 0) {
+                lab2_time = measure_sort_time(&g_lab2_io,
+                                              "input.bin",
+                                              "output_lab2.bin",
+                                              total,
+                                              chunk);
+            }
         }
-        g_lab2_open  = (lab2_open_t)dlsym(handle, "lab2_open");
-        g_lab2_close = (lab2_close_t)dlsym(handle, "lab2_close");
-        g_lab2_read  = (lab2_read_t)dlsym(handle, "lab2_read");
-        g_lab2_write = (lab2_write_t)dlsym(handle, "lab2_write");
-        g_lab2_lseek = (lab2_lseek_t)dlsym(handle, "lab2_lseek");
-        g_lab2_fsync = (lab2_fsync_t)dlsym(handle, "lab2_fsync");
 
-        char *error;
-        if ((error = dlerror()) != NULL) {
-            fprintf(stderr, "dlsym error: %s\n", error);
-            dlclose(handle);
-            return 1;
+        if (sys_time < 0) {
+            printf(" %10zu | %10zu |      error     |", total, chunk);
+        } else {
+            printf(" %10zu | %10zu | %15.2f |", total, chunk, sys_time);
         }
-    } else {
-        fprintf(stderr, "Unknown mode '%s'. Use sys or lib.\n", mode);
-        return 1;
-    }
 
-    // Выполним внешнюю сортировку
-    // Результат положим в "sorted.bin"
-    const char* output_sorted = "sorted.bin";
-
-    double t1 = get_time_ms();
-    if (external_sort(path, output_sorted, count, chunk_size) < 0) {
-        fprintf(stderr, "external_sort failed\n");
-        return 1;
-    }
-    double t2 = get_time_ms();
-    double dt = t2 - t1;
-
-    // Проверим, что итоговый файл действительно отсортирован
-    if (check_sorted(output_sorted, count) == 0) {
-        printf("Mode=%s, external sort OK. Elapsed=%.2f ms\n", mode, dt);
-    } else {
-        printf("Mode=%s, external sort - file not sorted!\n", mode);
-    }
-
-    // Для чистоты эксперимента можно удалить временные ран-файлы:
-    // run_0.bin, run_1.bin, ...
-    // (Если очень много ран, это неэффективно делать простым циклом, но для демо - пойдёт)
-    for (int i = 0; ; i++) {
-        char run_name[256];
-        snprintf(run_name, sizeof(run_name), "run_%d.bin", i);
-        // попробуем открыть на чтение
-        int fd_test = open(run_name, O_RDONLY);
-        if (fd_test < 0) {
-            break; // предполагаем, что таких файлов больше нет
+        if (!lab2_ok) {
+            printf("   (no liblab2)\n");
+        } else if (lab2_time < 0) {
+            printf("      error\n");
+        } else {
+            printf(" %14.2f\n", lab2_time);
         }
-        close(fd_test);
-        unlink(run_name);
     }
 
     return 0;
