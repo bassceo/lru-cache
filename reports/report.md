@@ -52,79 +52,54 @@
 
 ## 1. Общая идея
 
-![animation.gif](https://cdn.buildin.ai/s3/1ba8b07b-d459-47b1-9119-fb6e04f6b559/animation.gif?time=1741681800&token=30d731a672953db5c62dbfc57ae08cfb&role=sharePaid)
+![animation.gif](./animation.gif)
 
-- **`Lab2File`** – структура, которая хранит всё необходимое для работы с файлом в вашей библиотеке: настоящий файловый дескриптор, текущий размер файла, «курсор» (смещение для чтения/записи), LRU-список (для управления блоками в кэше) и хеш-таблицу (для ускоренного поиска нужных блоков).
+В новом варианте кода используется **стратегия случайного вытеснения (Random)**. При необходимости освободить место в кэше выбирается случайная «корзина» (bucket) хеш-таблицы, из неё берётся один блок, который и вытесняется. При этом нет никакой структуры LRU-списка, а доступ к блокам хранится исключительно в хеш-цепочках.
 
-- **`CacheBlock`** – один блок кэша (по умолчанию 4096 байт). Содержит:
+- **Lab2File** – структура, хранящая основную информацию:
 
-  - `block_number` – номер блока в файле (каждый блок = 4096 байт).
+  - `fd` — реальный файловый дескриптор.
+  - `file_size` — текущий размер реального файла.
+  - `offset` — «курсор» (смещение для чтения/записи).
+  - `cache_count` — число блоков, сейчас находящихся в кэше.
+  - `hash_table` — массив «корзин» для хеширования блоков (размер `CACHE_CAPACITY`).
 
-  - `data` – выделенную память под блок.
+- **CacheBlock** – структура, описывающая один блок кэша. Содержит:
 
-  - `dirty` – флаг «грязный ли блок» (true, если данные в кэше отличаются от диска).
-
-  - ссылки на блоки в двусвязном LRU-списке и на следующий блок в хеш-цепочке.
+  - `block_number` — номер блока в файле (каждый блок по умолчанию `BLOCK_SIZE` байт).
+  - `data` — указатель на выделенную память под данные блока.
+  - `dirty` — флаг «грязности» (true, если данные в блоке ещё не записаны на диск).
+  - `next_hash` — указатель на следующий блок в цепочке хеш-таблицы.
 
 - При **чтении** или **записи** данных:
 
   1. Вычисляется номер блока `block_num = offset / BLOCK_SIZE`.
+  2. В хеш-таблице ищется блок (функция `find_block`).
+     - Если блока нет, он подгружается (`load_block`), при необходимости вытесняя «случайный» блок (функция `evict_block`).
+  3. Производится копирование данных (чтение или запись) в/из `CacheBlock->data`.
+  4. Если данные были записаны, блок помечается «грязным» (`dirty = true`).
 
-  2. Ищется блок в хеш-таблице (функция `find_block`).
-
-    - Если блока нет, он загружается (функция `load_block`), при необходимости вытесняя «самый старый» (LRU-`tail`).
-
-  3. Данные копируются в/из блока кэша.
-
-  4. В случае записи блок помечается «грязным» (dirty = true).
-
-- При **закрытии** или явном `lab2_fsync` «грязные» блоки пишутся на диск.
+- При **закрытии** (`lab2_close`) или при явном вызове `lab2_fsync` все «грязные» блоки (из хеш-цепочек, хотя в текущем упрощённом коде обрабатывается лишь первая «корзина») дозаписываются на диск.
 
 ## 2. Обзор кода
 
+Код стал заметно проще по сравнению с вариантом на LRU: в нём нет списка «голова-хвост» и нет функций, связанных с перемещением блоков в начало или конец. Однако сам механизм чтения/записи и работы с хеш-таблицей (поиск, добавление, удаление блоков) остался.
+
 ## Вспомогательные функции
 
-### `static unsigned hash_off(off_t block_number)`
+### static unsigned hash_off(off_t block_number)
 
-```C
+```c
 static unsigned hash_off(off_t block_number) {
     return (unsigned)(block_number % CACHE_CAPACITY);
 }
 ```
 
+- **Зачем**: вычисляет индекс корзины в хеш-таблице, используя операцию `block_number % CACHE_CAPACITY`.
 
-- **Зачем**: рассчитывает индекс для хеш-таблицы, исходя из номера блока в файле.
+### static void remove_from_hash(Lab2File *f, CacheBlock *b)
 
-- **Как**: берёт номер блока `% CACHE_CAPACITY`, чтобы получить «корзину» (bucket) в хеш-таблице.
-
-### `static void move_to_head(Lab2File *f, CacheBlock *b)`
-
-```C
-static void move_to_head(Lab2File *f, CacheBlock *b) {
-    if (!b || b == f->lru_head) return;
-    if (b->prev) b->prev->next = b->next;
-    if (b->next) b->next->prev = b->prev;
-    if (f->lru_tail == b) f->lru_tail = b->prev;
-    b->prev = NULL;
-    b->next = f->lru_head;
-    if (f->lru_head) f->lru_head->prev = b;
-    f->lru_head = b;
-    if (!f->lru_tail) f->lru_tail = b;
-}
-```
-
-
-- **Зачем**: если блок уже есть в кэше, при доступе к нему нужно поднять его в голову LRU-списка (он становится «наиболее недавно использованным»).
-
-- **Как**:
-
-  - Удаляет блок из текущего места в двусвязном списке.
-
-  - Ставит его в начало (`lru_head`).
-
-### `static void remove_from_hash(Lab2File *f, CacheBlock *b)`
-
-```C
+```c
 static void remove_from_hash(Lab2File *f, CacheBlock *b) {
     unsigned i = hash_off(b->block_number);
     CacheBlock *p = f->hash_table[i], *prevp = NULL;
@@ -140,50 +115,50 @@ static void remove_from_hash(Lab2File *f, CacheBlock *b) {
 }
 ```
 
+- **Зачем**: удаляет блок `b` из соответствующей цепочки хеш-таблицы.  
+- **Как**: находит блок в списке `hash_table[i]` и убирает из связанного списка `next_hash`.
 
-- **Зачем**: удаляет блок из цепочки хеш-таблицы (когда блок вытесняют или закрывают файл).
+### static CacheBlock* evict_block(Lab2File *f)
 
-- **Как**:
-
-  - Ищет в соответствующей «корзине» (полученной через `hash_off`) блок `b`.
-
-  - Убирает его из связанного списка `next_hash`.
-
-### `static CacheBlock* evict_block(Lab2File *f)`
-
-```C
+```c
 static CacheBlock* evict_block(Lab2File *f) {
-    CacheBlock *b = f->lru_tail;
-    if (!b) return NULL;
+    if (f->cache_count == 0) return NULL;
+    
+    unsigned bucket = rand() % CACHE_CAPACITY;
+    unsigned original_bucket = bucket;
+    CacheBlock *b = NULL;
+    CacheBlock *prev = NULL;
+
+    while (!f->hash_table[bucket] && bucket < CACHE_CAPACITY) bucket++;
+    if (bucket == CACHE_CAPACITY) {
+        bucket = 0;
+        while (!f->hash_table[bucket] && bucket < original_bucket) bucket++;
+    }
+
+    if (!f->hash_table[bucket]) return NULL;
+
+    b = f->hash_table[bucket];
     if (b->dirty) {
         off_t off = b->block_number * BLOCK_SIZE;
         pwrite(f->fd, b->data, BLOCK_SIZE, off);
     }
-    remove_from_hash(f, b);
-    if (b->prev) b->prev->next = NULL;
-    f->lru_tail = b->prev;
-    if (f->lru_head == b) f->lru_head = NULL;
+
+    f->hash_table[bucket] = b->next_hash;
     f->cache_count--;
     return b;
 }
 ```
 
-
-- **Зачем**: при переполнении кэша нужно «вытеснить» (удалить) блок. По политике LRU, вытесняем хвост — «самый давно неиспользуемый».
-
+- **Зачем**: при переполнении кэша освобождает место, выбрав **случайную «корзину»** (и затем конкретный блок) для вытеснения.  
 - **Как**:
+  1. Генерирует случайное число `rand() % CACHE_CAPACITY`.
+  2. В выбранной (или последующих) корзинах хеш-таблицы ищет первый доступный (непустой) блок.
+  3. Если блок «грязный», записывает его на диск.
+  4. Удаляет найденный блок из хеш-цепочки (и уменьшает `cache_count`).
 
-  1. Берёт `lru_tail` (последний в списке LRU).
+### static CacheBlock* find_block(Lab2File *f, off_t block_num)
 
-  2. Если он «грязный», записывает данные на диск.
-
-  3. Удаляет его из хеш-таблицы и LRU-списка.
-
-  4. Уменьшает счётчик кэша и возвращает указатель на этот блок (чтобы вызывающая функция могла освободить память).
-
-### `static CacheBlock* find_block(Lab2File *f, off_t block_num)`
-
-```C
+```c
 static CacheBlock* find_block(Lab2File *f, off_t block_num) {
     unsigned i = hash_off(block_num);
     CacheBlock *b = f->hash_table[i];
@@ -195,18 +170,12 @@ static CacheBlock* find_block(Lab2File *f, off_t block_num) {
 }
 ```
 
+- **Зачем**: ищет нужный блок в кэше (хеш-таблице).  
+- **Как**: берёт индекс корзины через `hash_off(block_num)` и идёт по списку `next_hash`, пока не найдёт блок с номером `block_num`.
 
-- **Зачем**: ищет блок в хеш-таблице (в кэше), чтобы понять, загружен ли уже требуемый блок.
+### static CacheBlock* load_block(Lab2File *f, off_t block_num)
 
-- **Как**:
-
-  - Считает индекс через `hash_off(block_num)`.
-
-  - Проходит по цепочке `next_hash` в этой корзине, сравнивая `block_number`.
-
-### `static CacheBlock* load_block(Lab2File *f, off_t block_num)`
-
-```C
+```c
 static CacheBlock* load_block(Lab2File *f, off_t block_num) {
     if (f->cache_count >= CACHE_CAPACITY) {
         CacheBlock *victim = evict_block(f);
@@ -219,7 +188,7 @@ static CacheBlock* load_block(Lab2File *f, off_t block_num) {
     posix_memalign((void**)&b->data, BLOCK_SIZE, BLOCK_SIZE);
     b->block_number = block_num;
     b->dirty = false;
-    b->prev = b->next = b->next_hash = NULL;
+    b->next_hash = NULL;
     {
         off_t off = block_num * BLOCK_SIZE;
         ssize_t r = pread(f->fd, b->data, BLOCK_SIZE, off);
@@ -231,46 +200,39 @@ static CacheBlock* load_block(Lab2File *f, off_t block_num) {
         b->next_hash = f->hash_table[i];
         f->hash_table[i] = b;
     }
-    b->next = f->lru_head;
-    if (f->lru_head) f->lru_head->prev = b;
-    f->lru_head = b;
-    if (!f->lru_tail) f->lru_tail = b;
     f->cache_count++;
     return b;
 }
 ```
 
-
-- **Зачем**: загрузить новый блок из файла в кэш, если он ещё не был загружен.
-
+- **Зачем**: загружает блок из файла в кэш, если блок ещё не в хеш-таблице.  
 - **Как**:
-
-  1. При необходимости (если кэш переполнен) вызывает `evict_block`.
-
-  2. Выделяет под блок структуру `CacheBlock` и память под `data` (используя `posix_memalign` под прямой ввод-вывод).
-
-  3. Считывает данные с диска (через `pread`).
-
-  4. Добавляет блок в начало LRU-списка и в хеш-таблицу.
-
-  5. Увеличивает счётчик кэша.
+  1. Если кэш переполнен (`cache_count == CACHE_CAPACITY`), вызывает `evict_block`, затем освобождает память вытеснённого блока.
+  2. Выделяет `CacheBlock` и память под `data`.
+  3. Считывает с диска нужные данные (через `pread`).
+  4. Добавляет блок в начало цепочки соответствующей корзины `hash_table[i]`.
+  5. Увеличивает счётчик `cache_count`.
 
 ---
 
 ## Основные интерфейсные функции
 
-### `int lab2_open(const char *path)`
+### int lab2_open(const char *path)
 
-```C
+```c
 int lab2_open(const char *path) {
+    static bool seed_initialized = false;
+    if (!seed_initialized) {
+        srand(time(NULL));
+        seed_initialized = true;
+    }
+
     int real_fd = open(path, O_CREAT | O_RDWR | O_DIRECT, 0666);
     if (real_fd < 0) return -1;
     Lab2File *lf = malloc(sizeof(Lab2File));
     memset(lf, 0, sizeof(Lab2File));
     lf->fd = real_fd;
     lf->offset = 0;
-    lf->lru_head = NULL;
-    lf->lru_tail = NULL;
     lf->cache_count = 0;
     memset(lf->hash_table, 0, sizeof(lf->hash_table));
     lf->file_size = lseek(real_fd, 0, SEEK_END);
@@ -278,39 +240,29 @@ int lab2_open(const char *path) {
     file_index++;
     return file_index - 1;
 }
-
 ```
 
-
-- **Зачем**: открывает (или создаёт) реальный файл и инициализирует свою структуру `Lab2File`.
-
+- **Зачем**: открывает (или создаёт) реальный файл и инициализирует структуру `Lab2File`.  
 - **Как**:
+  1. Инициализирует `rand(...)` при первом вызове, чтобы стратегия вытеснения была действительно «случайной».
+  2. Вызывает `open` с флагами `O_CREAT | O_RDWR | O_DIRECT`.
+  3. Выделяет `Lab2File` и обнуляет все поля.
+  4. Запоминает реальный `fd`, через `lseek` определяет размер файла, кладёт структуру в глобальный массив `files[]`.
 
-  1. Вызывает `open` с `O_CREAT | O_RDWR | O_DIRECT`.
+### int lab2_close(int fd)
 
-  2. Создаёт `Lab2File`, обнуляет поля (включая кэш и LRU-список).
-
-  3. Запоминает полученный `fd` и вычисляет размер файла через `lseek(..., SEEK_END)`.
-
-  4. Сохраняет указатель на `Lab2File` в глобальном массиве `files[]`, возвращает индекс.
-
-### `int lab2_close(int fd)`
-
-```C
+```c
 int lab2_close(int fd) {
     Lab2File *f = get_file(fd);
     if (!f) return -1;
     for (;;) {
-        CacheBlock *b = f->lru_tail;
+        CacheBlock *b = f->hash_table[0];
         if (!b) break;
         if (b->dirty) {
             off_t off = b->block_number * BLOCK_SIZE;
             pwrite(f->fd, b->data, BLOCK_SIZE, off);
         }
         remove_from_hash(f, b);
-        if (b->prev) b->prev->next = NULL;
-        f->lru_tail = b->prev;
-        if (f->lru_head == b) f->lru_head = NULL;
         free(b->data);
         free(b);
     }
@@ -321,24 +273,18 @@ int lab2_close(int fd) {
 }
 ```
 
-
-- **Зачем**: закрывает виртуальный дескриптор (и реальный файл), сбрасывает кэш на диск, освобождает память.
-
+- **Зачем**: закрывает файл, а также сбрасывает «грязные» блоки на диск и освобождает память.  
 - **Как**:
+  1. Получает `Lab2File` через `get_file`.
+  2. В упрощённом варианте — обрабатывает блоки, хранящиеся (по коду) лишь в `hash_table[0]`.
+  3. Если блок «грязный», выполняет `pwrite` на диск.
+  4. Удаляет блок из хеш-таблицы, освобождает память.
+  5. Закрывает реальный дескриптор `close(f->fd)`.
+  6. Удаляет запись из `files[]`.
 
-  1. Находит соответствующий `Lab2File` в глобальном массиве (через `get_file`).
+### ssize_t lab2_read(int fd, void *buf, size_t count)
 
-  2. Идёт по LRU-списку (от хвоста к голове) и, если блок «грязный», записывает на диск.
-
-  3. Удаляет блоки из хеш-таблицы, освобождает их данные.
-
-  4. Закрывает реальный дескриптор файла (функцией `close`).
-
-  5. Удаляет запись из массива `files[]`.
-
-### `ssize_t lab2_read(int fd, void *buf, size_t count)`
-
-```C
+```c
 ssize_t lab2_read(int fd, void *buf, size_t count) {
     Lab2File *f = get_file(fd);
     if (!f) return -1;
@@ -360,14 +306,10 @@ ssize_t lab2_read(int fd, void *buf, size_t count) {
         if (can_read > count) {
             can_read = count;
         }
-        // поиск/загрузка блока
         CacheBlock *b = find_block(f, bn);
         if (!b) {
             b = load_block(f, bn);
-        } else {
-            move_to_head(f, b);
         }
-        // копирование
         memcpy(p, b->data + off, can_read);
         total += can_read;
         p += can_read;
@@ -378,32 +320,18 @@ ssize_t lab2_read(int fd, void *buf, size_t count) {
 }
 ```
 
-
-- **Зачем**: читает из файла данные, используя кэш (поблочно).
-
+- **Зачем**: читать данные из кэша, подгружая нужные блоки, если их нет в хеш-таблице.  
 - **Как**:
+  1. Проверяет, не вышли ли за конец файла.
+  2. При необходимости уменьшает `count`, чтобы не читать «за файл».
+  3. В цикле разбивает чтение на куски размером `BLOCK_SIZE - off` (учитывая смещение внутри блока).
+  4. Если нужного блока нет в кэше, вызывает `load_block`.
+  5. Копирует данные из `b->data` в пользовательский буфер.
+  6. Обновляет `offset` и уменьшает `count` до полного чтения.
 
-  1. Находит `Lab2File`.
+### ssize_t lab2_write(int fd, const void *buf, size_t count)
 
-  2. Проверяет границы (не выходим ли за конец файла).
-
-  3. В цикле пока есть данные для чтения:
-
-    - Вычисляет номер блока (`bn = offset / BLOCK_SIZE`) и смещение в блоке.
-
-    - Пытается найти блок в кэше (`find_block`); если нет — загружает (`load_block`).
-
-    - Копирует нужную часть из кэш-блока в `buf`.
-
-    - Обновляет `offset`, уменьшает `count`.
-
-    - Повторяет до тех пор, пока не прочитается требуемое количество.
-
-  4. Возвращает, сколько байт реально прочитано.
-
-### `ssize_t lab2_write(int fd, const void *buf, size_t count)`
-
-```C
+```c
 ssize_t lab2_write(int fd, const void *buf, size_t count) {
     Lab2File *f = get_file(fd);
     if (!f) return -1;
@@ -430,19 +358,15 @@ ssize_t lab2_write(int fd, const void *buf, size_t count) {
                 memset(b->data, 0, BLOCK_SIZE);
                 b->block_number = bn;
                 b->dirty = false;
-                b->prev = b->next = b->next_hash = NULL;
+                b->next_hash = NULL;
                 {
                     unsigned i = hash_off(bn);
                     b->next_hash = f->hash_table[i];
                     f->hash_table[i] = b;
                 }
-                b->next = f->lru_head;
-                if (f->lru_head) f->lru_head->prev = b;
-                f->lru_head = b;
-                if (!f->lru_tail) f->lru_tail = b;
                 f->cache_count++;
             }
-        } else move_to_head(f, b);
+        }
         memcpy(b->data + off, p, can_write);
         b->dirty = true;
         total += can_write;
@@ -462,30 +386,19 @@ ssize_t lab2_write(int fd, const void *buf, size_t count) {
 }
 ```
 
-
-- **Зачем**: записывает данные, используя кэш (поблочно).
-
+- **Зачем**: записывает данные через кэш, создавая/загружая блоки при необходимости.  
 - **Как**:
+  1. Разбивает `count` на части, чтобы корректно заполнить блоки (с учётом смещения `off`).
+  2. Ищет блок в кэше (через `find_block`). Если нет:
+     - Если нужно частично изменить блок (не переписывая весь 512/2048/4096 байт), то его подгружают (`load_block`).
+     - Если переписывается весь блок, создают новый (при необходимости предварительно вытесняют по `evict_block`).
+  3. Записывает данные в `b->data`, ставит флаг `dirty = true`.
+  4. Обновляет `offset` и при необходимости `file_size`.
+  5. Если кэш переполнен, снова вызывает `evict_block`.
 
-  1. Находит `Lab2File`.
+### off_t lab2_lseek(int fd, off_t offset, int whence)
 
-  2. В цикле разбивает `count` на части по размеру кэш-блока (4096 байт) с учётом внутреннего смещения в блоке.
-
-  3. Ищет блок в кэше. Если отсутствует, загружает (если нужно частично обновить блок) или создаёт новый пустой блок (если перекрывается весь 4096).
-
-  4. Копирует данные из пользовательского буфера в `b->data`.
-
-  5. Ставит `b->dirty = true`.
-
-  6. Двигает `offset` вперёд, обновляет `file_size`, если ушли дальше «конца».
-
-  7. При переполнении кэша вызывает `evict_block`.
-
-  8. Возвращает, сколько байт записано.
-
-### `off_t lab2_lseek(int fd, off_t offset, int whence)`
-
-```C
+```c
 off_t lab2_lseek(int fd, off_t offset, int whence) {
     Lab2File *f = get_file(fd);
     if (!f) return -1;
@@ -500,54 +413,38 @@ off_t lab2_lseek(int fd, off_t offset, int whence) {
 }
 ```
 
-
-- **Зачем**: меняет «курсор» (текущее смещение в файле).
-
+- **Зачем**: изменяет «курсор» (смещение) в файле.  
 - **Как**:
+  1. Вычисляет новое смещение `new_off` в зависимости от `whence`.
+  2. Проверяет, не ушло ли в «отрицательную» зону.
+  3. Сохраняет новое смещение в `f->offset`.
 
-  1. Находит `Lab2File`.
+### int lab2_fsync(int fd)
 
-  2. Вычисляет новый `offset` в зависимости от `whence` (`SEEK_SET`, `SEEK_CUR`, `SEEK_END`).
-
-  3. Запоминает его в структуре `Lab2File` (если не уходит в «отрицательное» значение).
-
-  4. Возвращает текущий `offset`.
-
-### `int lab2_fsync(int fd)`
-
-```C
+```c
 int lab2_fsync(int fd) {
     Lab2File *f = get_file(fd);
     if (!f) return -1;
-    CacheBlock *b = f->lru_head;
+    CacheBlock *b = f->hash_table[0];
     while (b) {
         if (b->dirty) {
             off_t off = b->block_number * BLOCK_SIZE;
             pwrite(f->fd, b->data, BLOCK_SIZE, off);
             b->dirty = false;
         }
-        b = b->next;
+        b = b->next_hash;
     }
     fsync(f->fd);
     return 0;
 }
-
 ```
 
-
-- **Зачем**: сбрасывает все «грязные» (dirty) блоки на диск, чтобы гарантировать сохранение.
-
+- **Зачем**: гарантирует, что «грязные» блоки будут сброшены на диск.  
 - **Как**:
-
-  1. Находит `Lab2File`.
-
-  2. Проходит по всему LRU-списку (от `lru_head` к `lru_tail`).
-
-  3. Если блок «грязный», выполняет `pwrite` и сбрасывает флаг `dirty`.
-
-  4. Вызвает `fsync` на реальном `fd`.
-
-  5. Возвращает 0 при успехе (или -1 при ошибке).
+  1. Проходит по цепочке блоков в корзине `hash_table[0]` (в упрощённом примере).
+  2. Если блок помечен как `dirty`, записывает его (`pwrite`).
+  3. Сбрасывает системные буферы диска командой `fsync`.
+  4. Возвращает 0 при успехе или -1 при ошибке.
 
 ---
 
@@ -573,6 +470,8 @@ int lab2_fsync(int fd) {
               `"""            GPU: 00:02.0 Red Hat, Inc. Virtio 1.0 GPU 
                               Memory: 1750MiB / 3921MiB 
 ```
+
+<img src="./stats.png">
 
 ```C
 #define BLOCK_SIZE 4096
