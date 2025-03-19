@@ -12,7 +12,7 @@ echo "==================================================="
 echo
 
 # Test 1: Cache Performance Test
-echo "Test 1: LRU Cache Performance Test"
+echo "Test 1: Random Cache Performance Test"
 echo "Description: Evaluating cache performance with different"
 echo "file sizes and access patterns (sequential and random)"
 echo "==================================================="
